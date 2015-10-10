@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
+use Cookie;
 use DB;
 use Input;
 use File;
@@ -24,23 +25,23 @@ use App\Events\PostWasModified;
 use App\Events\ThreadNewReply;
 
 class Post extends Model {
-	
+
 	use SoftDeletes;
-	
+
 	/**
 	 * The database table used by the model.
 	 *
 	 * @var string
 	 */
 	protected $table = 'posts';
-	
+
 	/**
 	 * The primary key that is used by ::get()
 	 *
 	 * @var string
 	 */
 	protected $primaryKey = 'post_id';
-	
+
 	/**
 	 * The attributes that are mass assignable.
 	 *
@@ -53,27 +54,28 @@ class Post extends Model {
 		'reply_to_board_id',
 		'reply_last',
 		'bumped_last',
-		
+
 		'stickied',
 		'stickied_at',
 		'bumplocked_at',
 		'locked_at',
-		
+
 		'author_ip',
 		'author_ip_nulled_at',
+		'author_salt',
 		'author_id',
 		'author_country',
 		'capcode_id',
 		'subject',
 		'author',
 		'email',
-		
+
 		'body',
 		'body_parsed',
 		'body_parsed_at',
 		'body_html',
 	];
-	
+
 	/**
 	 * The attributes excluded from the model's JSON form.
 	 *
@@ -86,7 +88,8 @@ class Post extends Model {
 		'body_parsed',
 		'body_parsed_at',
 		'body_html',
-		
+		'author_salt',
+
 		// Relationships
 		'bans',
 		'board',
@@ -98,89 +101,89 @@ class Post extends Model {
 		'replies',
 		'reports',
 	];
-	
+
 	/**
 	 * Attributes which do not exist but should be appended to the JSON output.
 	 *
 	 * @var array
 	 */
 	protected $appends = ['content_raw', 'content_html'];
-	
+
 	/**
 	 * Attributes which are automatically sent through a Carbon instance on load.
 	 *
 	 * @var array
 	 */
 	protected $dates = ['reply_last', 'bumped_last', 'created_at', 'updated_at', 'deleted_at', 'stickied_at', 'bumplocked_at', 'locked_at', 'body_parsed_at', 'author_ip_nulled_at'];
-	
-	
-	
+
+
+
 	public function attachments()
 	{
 		return $this->belongsToMany("\App\FileStorage", 'file_attachments', 'post_id', 'file_id')->withPivot('filename', 'is_spoiler');
 	}
-	
+
 	public function attachmentLinks()
 	{
 		return $this->hasMany("\App\FileAttachment");
 	}
-	
+
 	public function bans()
 	{
 		return $this->hasMany('\App\Ban', 'post_id');
 	}
-	
+
 	public function board()
 	{
 		return $this->belongsTo('\App\Board', 'board_uri');
 	}
-	
+
 	public function capcode()
 	{
 		return $this->hasOne('\App\Role', 'role_id', 'capcode_id');
 	}
-	
+
 	public function cites()
 	{
 		return $this->hasMany('\App\PostCite', 'post_id');
 	}
-	
+
 	public function citedBy()
 	{
 		return $this->hasMany('\App\PostCite', 'cite_id', 'post_id');
 	}
-	
+
 	public function citedPosts()
 	{
 		return $this->belongsToMany("\App\Post", 'post_cites', 'post_id');
 	}
-	
+
 	public function citedByPosts()
 	{
 		return $this->belongsToMany("\App\Post", 'post_cites', 'cite_id', 'post_id');
 	}
-	
+
 	public function editor()
 	{
 		return $this->hasOne('\App\User', 'user_id', 'updated_by');
 	}
-	
+
 	public function op()
 	{
 		return $this->belongsTo('\App\Post', 'reply_to', 'post_id');
 	}
-	
+
 	public function replies()
 	{
 		return $this->hasMany('\App\Post', 'reply_to', 'post_id');
 	}
-	
+
 	public function reports()
 	{
 		return $this->hasMany('\App\Report', 'post_id');
 	}
-	
-	
+
+
 	/**
 	 * Ties database triggers to the model.
 	 *
@@ -189,32 +192,32 @@ class Post extends Model {
 	public static function boot()
 	{
 		parent::boot();
-		
+
 		// Setup event bindings...
-		
+
 		// When creating a post, make sure it has a board_id.
 		static::creating(function($post)
 		{
 			return isset($post->board_id);
 		});
-		
+
 		// Fire events on post created.
 		static::created(function(Post $post) {
 			Event::fire(new PostWasAdded($post));
 		});
-		
+
 		// When deleting a post, delete its children.
 		static::deleting(function($post)
 		{
 			static::replyTo($post->post_id)->delete();
 		});
-		
+
 		// After a post is deleted, update OP's reply count.
 		static::deleted(function($post) {
 			if (!is_null($post->reply_to))
 			{
 				$lastReply = $post->op->getReplyLast();
-				
+
 				if ($lastReply)
 				{
 					$post->op->reply_last = $lastReply->created_at;
@@ -223,23 +226,23 @@ class Post extends Model {
 				{
 					$post->op->reply_last = $post->op->created_at;
 				}
-				
+
 				$post->op->reply_count -= 1;
 				$post->op->save();
 			}
-			
+
 			Event::fire(new PostWasDeleted($post));
 		});
-		
+
 		// Update citation references
 		static::saved(function(Post $post)
 		{
 			$post->cites()->delete();
-			
+
 			// Process citations.
 			$cited = $post->getCitesFromText();
 			$cites = [];
-			
+
 			foreach ($cited['posts'] as $citedPost)
 			{
 				$cites[] = new PostCite([
@@ -250,7 +253,7 @@ class Post extends Model {
 					'cite_board_id'  => $citedPost->board_id,
 				]);
 			}
-			
+
 			foreach ($cited['boards'] as $citedBoard)
 			{
 				$cites[] = new PostCite([
@@ -258,22 +261,22 @@ class Post extends Model {
 					'cite_board_uri' => $citedBoard->board_uri,
 				]);
 			}
-			
+
 			if (count($cites) > 0)
 			{
 				$post->cites()->saveMany($cites);
 			}
-			
+
 		});
-		
+
 		// Fire events on post updated.
 		static::updated(function(Post $post)
 		{
 			Event::fire(new PostWasModified($post));
 		});
-		
+
 	}
-	
+
 	/**
 	 * Determines if the user can bumplock this post
 	 *
@@ -284,7 +287,7 @@ class Post extends Model {
 	{
 		return $user->canBumplock($this);
 	}
-	
+
 	/**
 	 * Determines if the user can delete this post.
 	 *
@@ -295,7 +298,7 @@ class Post extends Model {
 	{
 		return $user->canDelete($this);
 	}
-	
+
 	/**
 	 * Determines if the user can edit this post.
 	 *
@@ -306,7 +309,7 @@ class Post extends Model {
 	{
 		return $user->canEdit($this);
 	}
-	
+
 	/**
 	 * Determines if the user can lock this post
 	 *
@@ -317,7 +320,7 @@ class Post extends Model {
 	{
 		return $user->canLock($this);
 	}
-	
+
 	/**
 	 * Determines if the user can reply to post, or if this thread is open to replies in general.
 	 *
@@ -330,10 +333,10 @@ class Post extends Model {
 		{
 			return $user->canReply($this);
 		}
-		
+
 		return true;
 	}
-	
+
 	/**
 	 * Determines if the user can report this post to board owners.
 	 *
@@ -344,7 +347,7 @@ class Post extends Model {
 	{
 		return $user->canReport($this);
 	}
-	
+
 	/**
 	 * Determines if the user can report this post to site owners.
 	 *
@@ -355,7 +358,7 @@ class Post extends Model {
 	{
 		return $user->canReportGlobally($this);
 	}
-	
+
 	/**
 	 * Determines if the user can sticky or unsticky this post.
 	 *
@@ -366,8 +369,8 @@ class Post extends Model {
 	{
 		return $user->canSticky($this);
 	}
-	
-	
+
+
 	/**
 	 * Counts the number of currently related reports that can be promoted.
 	 *
@@ -377,7 +380,7 @@ class Post extends Model {
 	public function countReportsCanPromote(PermissionUser $user)
 	{
 		$count = 0;
-		
+
 		foreach ($this->reports as $report)
 		{
 			if ($report->canPromote($user))
@@ -385,10 +388,10 @@ class Post extends Model {
 				++$count;
 			}
 		}
-		
+
 		return $count;
 	}
-	
+
 	/**
 	 * Counts the number of currently related reports that can be demoted.
 	 *
@@ -398,7 +401,7 @@ class Post extends Model {
 	public function countReportsCanDemote(PermissionUser $user)
 	{
 		$count = 0;
-		
+
 		foreach ($this->reports as $report)
 		{
 			if ($report->canDemote($user))
@@ -406,31 +409,51 @@ class Post extends Model {
 				++$count;
 			}
 		}
-		
+
 		return $count;
 	}
-	
-	
+
+
 	/**
 	 * Returns a small, unique code to identify an author in one thread.
 	 *
 	 * @return string
 	 */
+	 // TODO: Move makeAuthorId to the user class but still have this post passed to it (Makes it easier)
 	public function makeAuthorId()
 	{
 		$hashParts = [];
 		$hashParts[] = env('APP_KEY');
 		$hashParts[] = $this->board_uri;
 		$hashParts[] = $this->reply_to_board_id ?: $this->board_id;
-		$hashParts[] = $this->author_ip;
-		
+
+		// Get the users password if they have one set. If they don't get their laravel_session
+		// TODO: Change from using laravel_session to a cookie with a configurable time setting. Perhaps board specific?
+		$hashParts[] = !is_null(Cookie::get('author_password')) ?
+							Cookie::get('author_password'):
+							Cookie::get('laravel_session');
+
+		// Handle the salt
+		// Determine if this post has a salt set already (Meaning it's being saved)
+		if(!is_null($this->author_salt))
+		{
+			// Use the author_salt value as it's already
+			$hashParts[] = $this->author_salt;
+		}
+		else
+		{
+			$hashParts[] = hash(env('APP_HASH'), Cookie::get('author_salt'));
+		}
+
 		$hash = implode($hashParts, "-");
-		$hash = md5($hash);
+
+		// Hash using application defined hashing functions
+		$hash = hash(env('APP_HASH'), $hash);
 		$hash = substr($hash, 12, 6);
-		
+
 		return $hash;
 	}
-	
+
 	/**
 	 * Turns the author id into a consistent color.
 	 *
@@ -444,15 +467,15 @@ class Post extends Model {
 		$colors[] = crc32(substr($authorId, 0, 2)) % 254 + 1;
 		$colors[] = crc32(substr($authorId, 2, 2)) % 254 + 1;
 		$colors[] = crc32(substr($authorId, 4, 2)) % 254 + 1;
-		
+
 		if ($asArray)
 		{
 			return $colors;
 		}
-		
+
 		return "rgba(" . implode(",", $colors) . ",0.75)";
 	}
-	
+
 	/**
 	 * Takess the author id background color and determines if we need a white or black text color.
 	 *
@@ -461,12 +484,12 @@ class Post extends Model {
 	public function getAuthorIdForegroundColor()
 	{
 		$colors = $this->getAuthorIdBackgroundColor(true);
-		
+
 		if (array_sum($colors) < 382)
 		{
 			return "rgb(255,255,255)";
 		}
-		
+
 		foreach ($colors as $color)
 		{
 			if ($color > 200)
@@ -474,10 +497,10 @@ class Post extends Model {
 				return "rgb(0,0,0)";
 			}
 		}
-		
+
 		return "rgb(0,0,0)";
 	}
-	
+
 	/**
 	 * Returns the raw input for a post for the JSON output.
 	 *
@@ -489,10 +512,10 @@ class Post extends Model {
 		{
 			return $this->attributes['author_id'];
 		}
-		
+
 		return null;
 	}
-	
+
 	/**
 	 * Returns the fully rendered HTML content of this post.
 	 *
@@ -507,17 +530,17 @@ class Post extends Model {
 			{
 				return $this->body_html;
 			}
-			
+
 			if (!is_null($this->body_parsed))
 			{
 				return $this->body_parsed;
 			}
 		}
-		
+
 		$ContentFormatter     = new ContentFormatter();
 		$this->body_parsed    = $ContentFormatter->formatPost($this);
 		$this->body_parsed_at = $this->freshTimestamp();
-		
+
 		// We use an update here instead of just saving $post because, in this method
 		// there will frequently be additional properties on this object that cannot
 		// be saved. To make life easier, we just touch the object.
@@ -525,10 +548,10 @@ class Post extends Model {
 			'body_parsed'    => $this->body_parsed,
 			'body_parsed_at' => $this->body_parsed_at,
 		]);
-		
+
 		return $this->body_parsed;
 	}
-	
+
 	/**
 	 * Returns the raw input for a post for the JSON output.
 	 *
@@ -545,7 +568,7 @@ class Post extends Model {
 			return null;
 		}
 	}
-	
+
 	/**
 	 * Returns the rendered interior HTML for a post for the JSON output.
 	 *
@@ -562,7 +585,7 @@ class Post extends Model {
 			return null;
 		}
 	}
-	
+
 	/**
 	 * Returns a name for the country. This is usually the ISO 3166-1 alpha-2 code.
 	 *
@@ -576,13 +599,13 @@ class Post extends Model {
 			{
 				return "unknown";
 			}
-			
+
 			return $this->author_country;
 		}
-		
+
 		return null;
 	}
-	
+
 	/**
 	 * Returns the fully rendered HTML of a post in the JSON output.
 	 *
@@ -599,10 +622,10 @@ class Post extends Model {
 					'reply_to' => $this->reply_to ?: $this->board_id,
 			])->render();
 		}
-		
+
 		return null;
 	}
-	
+
 	/**
 	 * Returns a relative URL for opening this post.
 	 *
@@ -611,7 +634,7 @@ class Post extends Model {
 	public function getURL()
 	{
 		$url = "/{$this->board_uri}/thread/";
-		
+
 		if ($this->reply_to_board_id)
 		{
 			$url .= "{$this->reply_to_board_id}#{$this->board_id}";
@@ -620,11 +643,11 @@ class Post extends Model {
 		{
 			$url .= "{$this->board_id}";
 		}
-		
+
 		return $url;
 	}
-	
-	
+
+
 	/**
 	 * Determines if this is a bumpless post.
 	 *
@@ -636,10 +659,10 @@ class Post extends Model {
 		{
 			return true;
 		}
-		
+
 		return false;
 	}
-	
+
 	/**
 	 * Determines if this thread cannot be bumped.
 	 *
@@ -649,7 +672,7 @@ class Post extends Model {
 	{
 		return !is_null($this->bumplocked_at);
 	}
-	
+
 	/**
 	 * Determines if the post is made from the client's remote address.
 	 *
@@ -659,7 +682,7 @@ class Post extends Model {
 	{
 		return inet_ntop($this->author_ip) === \Request::ip();
 	}
-	
+
 	/**
 	 * Determines if this is deleted.
 	 *
@@ -669,7 +692,7 @@ class Post extends Model {
 	{
 		return !is_null($this->deleted_at);
 	}
-	
+
 	/**
 	 * Determines if this is the first reply in a thread.
 	 *
@@ -679,7 +702,7 @@ class Post extends Model {
 	{
 		return is_null($this->reply_to);
 	}
-	
+
 	/**
 	 * Determines if this thread is locked.
 	 *
@@ -689,7 +712,7 @@ class Post extends Model {
 	{
 		return !is_null($this->locked_at);
 	}
-	
+
 	/**
 	 * Determines if this thread is stickied.
 	 *
@@ -699,7 +722,7 @@ class Post extends Model {
 	{
 		return !is_null($this->stickied_at);
 	}
-	
+
 	/**
 	 * Returns the author IP in a human-readable format.
 	 *
@@ -711,10 +734,10 @@ class Post extends Model {
 		{
 			return inet_ntop($this->author_ip);
 		}
-		
+
 		return false;
 	}
-	
+
 	/**
 	 * Returns the bit size of the IP.
 	 *
@@ -726,10 +749,10 @@ class Post extends Model {
 		{
 			return strpos($this->getAuthorIpAsString(), ":") === false ? 32 : 128;
 		}
-		
+
 		return false;
 	}
-	
+
 	/**
 	 * Returns a user-friendly list of ranges available for this IP.
 	 *
@@ -740,7 +763,7 @@ class Post extends Model {
 		$bitsize = $this->getAuthorIpBitSize();
 		$range   = range(0, $bitsize);
 		$masks   = [];
-		
+
 		foreach ($range as $mask)
 		{
 			$affectedIps  = number_format(pow(2, $bitsize - $mask), 0);
@@ -749,10 +772,10 @@ class Post extends Model {
 				'ips'  => $affectedIps
 			]);
 		}
-		
+
 		return $masks;
 	}
-	
+
 	/**
 	 * Returns the board model for this post.
 	 *
@@ -764,7 +787,7 @@ class Post extends Model {
 			->get()
 			->first();
 	}
-	
+
 	/**
 	 * Returns a human-readable capcode string.
 	 *
@@ -776,10 +799,10 @@ class Post extends Model {
 		{
 			return trans_choice((string) $this->capcode_name, 0);
 		}
-		
+
 		return "";
 	}
-	
+
 	/**
 	 * Parses the post text for citations.
 	 *
@@ -789,7 +812,7 @@ class Post extends Model {
 	{
 		return ContentFormatter::getCites($this);
 	}
-	
+
 	/**
 	 * Returns the post model using the board's URI and the post's local board ID.
 	 *
@@ -805,7 +828,7 @@ class Post extends Model {
 			])
 			->first();
 	}
-	
+
 	/**
 	 * Returns the last post made by this user across the entire site.
 	 *
@@ -818,14 +841,14 @@ class Post extends Model {
 		{
 			$ip = Request::getClientIp();
 		}
-		
+
 		return Post::where('author_ip', $ip)
 			->orderBy('created_at', 'desc')
 			->take(1)
 			->get()
 			->first();
 	}
-	
+
 	/**
 	 * Returns the page on which this thread appears.
 	 * If the post is a reply, it will return the page it appears on in the thread, which is always 1.
@@ -839,13 +862,13 @@ class Post extends Model {
 			$board          = $this->board()->with('settings')->get()->first();
 			$visibleThreads = $board->threads()->op()->where('bumped_last', '>=', $this->bumped_last)->count();
 			$threadsPerPage = (int) $board->getConfig('postsPerPage', 10);
-			
+
 			return floor(($visibleThreads - 1) / $threadsPerPage) + 1;
 		}
-		
+
 		return 1;
 	}
-	
+
 	/**
 	 * Returns the model for this post's original post (what it is a reply to).
 	 *
@@ -857,7 +880,7 @@ class Post extends Model {
 			->get()
 			->first();
 	}
-	
+
 	/**
 	 * Returns a few posts for the front page.
 	 *
@@ -871,7 +894,7 @@ class Post extends Model {
 			->whereHas('board', function($query) use ($sfwOnly) {
 				$query->where('is_indexed', '=', true);
 				$query->where('is_overboard', '=', true);
-				
+
 				if ($sfwOnly)
 				{
 					$query->where('is_worksafe', '=', true);
@@ -882,7 +905,7 @@ class Post extends Model {
 			->orderBy('post_id', 'desc')
 			->get();
 	}
-	
+
 	/**
 	 * Returns the latest reply to a post.
 	 *
@@ -896,7 +919,7 @@ class Post extends Model {
 			->get()
 			->first();
 	}
-	
+
 	/**
 	 * Returns all replies to a post.
 	 *
@@ -908,12 +931,12 @@ class Post extends Model {
 		{
 			return $this->replies;
 		}
-		
+
 		return $this->replies()
 			->withEverything()
 			->get();
 	}
-	
+
 	/**
 	 * Returns the last few replies to a thread for index views.
 	 *
@@ -926,7 +949,7 @@ class Post extends Model {
 			->get()
 			->reverse();
 	}
-	
+
 	/**
 	 * Returns a set of posts for an update request.
 	 *
@@ -939,7 +962,7 @@ class Post extends Model {
 	public static function getUpdates($sinceTime, Board $board, $thread = null, $includeHTML = false)
 	{
 		$posts = static::whereInUpdate($sinceTime, $board, $thread)->get();
-		
+
 		if ($includeHTML)
 		{
 			foreach ($posts as $post)
@@ -947,10 +970,10 @@ class Post extends Model {
 				$post->setAppendHTML(true);
 			}
 		};
-		
+
 		return $posts;
 	}
-	
+
 	/**
 	 * Returns if this post has an attached IP address.
 	 *
@@ -960,7 +983,7 @@ class Post extends Model {
 	{
 		return !is_null($this->author_ip);
 	}
-	
+
 	/**
 	 * Get the appends attribute.
 	 * Not normally available to models, but required for API responses.
@@ -972,7 +995,7 @@ class Post extends Model {
 	{
 		return $this->appends;
 	}
-	
+
 	/**
 	 * Sets the value of $this->appends to the input.
 	 * Not normally available to models, but required for API responses.
@@ -984,7 +1007,7 @@ class Post extends Model {
 	{
 		return $this->appends = $appends;
 	}
-	
+
 	/**
 	 * Quickly add html to the append list for this model.
 	 *
@@ -994,7 +1017,7 @@ class Post extends Model {
 	public function setAppendHTML($add = true)
 	{
 		$appends   = $this->getAppends();
-		
+
 		if ($add)
 		{
 			$appends[] = "html";
@@ -1003,11 +1026,11 @@ class Post extends Model {
 		{
 			unset($appends[$key]);
 		}
-		
+
 		$this->setAppends($appends);
 		return $this;
 	}
-	
+
 	/**
 	 * Sets the bumplock property timestamp.
 	 *
@@ -1024,10 +1047,10 @@ class Post extends Model {
 		{
 			$this->bumplocked_at = null;
 		}
-		
+
 		return $this;
 	}
-	
+
 	/**
 	 * Sets the deleted timestamp.
 	 *
@@ -1044,10 +1067,10 @@ class Post extends Model {
 		{
 			$this->deleted_at = null;
 		}
-		
+
 		return $this;
 	}
-	
+
 	/**
 	 * Sets the locked property timestamp.
 	 *
@@ -1064,10 +1087,10 @@ class Post extends Model {
 		{
 			$this->locked_at = null;
 		}
-		
+
 		return $this;
 	}
-	
+
 	/**
 	 * Sets the sticky property of a post and updates relevant timestamps.
 	 *
@@ -1086,16 +1109,16 @@ class Post extends Model {
 			$this->stickied = false;
 			$this->stickied_at = null;
 		}
-		
+
 		return $this;
 	}
-	
-	
+
+
 	public function scopeAndAttachments($query)
 	{
 		return $query->with('attachments');
 	}
-	
+
 	public function scopeAndFirstAttachment($query)
 	{
 		return $query->with(['attachments' => function($query)
@@ -1103,7 +1126,7 @@ class Post extends Model {
 			$query->limit(1);
 		}]);
 	}
-	
+
 	public function scopeAndBans($query)
 	{
 		return $query->with(['bans' => function($query)
@@ -1111,7 +1134,7 @@ class Post extends Model {
 			$query->orderBy('created_at', 'asc');
 		}]);
 	}
-	
+
 	public function scopeAndCapcode($query)
 	{
 		return $query
@@ -1126,12 +1149,12 @@ class Post extends Model {
 				'roles.name as capcode_name'
 			);
 	}
-	
+
 	public function scopeAndCites($query)
 	{
 		return $query->with('cites', 'cites.cite');
 	}
-	
+
 	public function scopeAndEditor($query)
 	{
 		return $query
@@ -1144,14 +1167,14 @@ class Post extends Model {
 				'users.username as updated_by_username'
 			);
 	}
-	
+
 	public function scopeAndReplies($query)
 	{
 		return $query->with(['replies' => function($query) {
 			$query->withEverything();
 		}]);
 	}
-	
+
 	public function scopeAndReports($query)
 	{
 		return $query->with(['reports' => function($query) {
@@ -1159,55 +1182,55 @@ class Post extends Model {
 			$query->wherePromoted();
 		}]);
 	}
-	
+
 	public function scopeIp($query, $ip)
 	{
 		if (ctype_print($ip))
 		{
 			return $query->ipString($ip);
 		}
-		
+
 		return $query->ipBinary($ip);
 	}
-	
+
 	public function scopeIpString($query, $ip)
 	{
 		return $query->ipBinary(inet_pton($ip));
 	}
-	
+
 	public function scopeIpBinary($query, $ip)
 	{
 		return $query->where('author_ip', $ip);
 	}
-	
+
 	public function scopeOp($query)
 	{
 		return $query->where('reply_to', null);
 	}
-	
+
 	public function scopeRecent($query)
 	{
 		return $query->where('created_at', '>=', static::freshTimestamp()->subHour());
 	}
-	
+
 	public function scopeForIndex($query)
 	{
 		return $query->withEverything()
 			->orderBy('post_id', 'desc');
 			//->take( $this->stickied_at ? 1 : 5 );
 	}
-	
+
 	public function scopeReplyTo($query, $replies = false)
 	{
 		if ($replies instanceof \Illuminate\Database\Eloquent\Collection)
 		{
 			$thread_ids = [];
-			
+
 			foreach ($replies as $thread)
 			{
 				$thread_ids[] = (int) $thread->post_id;
 			}
-			
+
 			return $query->whereIn('reply_to', $thread_ids);
 		}
 		else if (is_numeric($replies))
@@ -1219,7 +1242,7 @@ class Post extends Model {
 			return $query->where('reply_to', 'not', null);
 		}
 	}
-	
+
 	public function scopeWithEverything($query)
 	{
 		return $query
@@ -1230,7 +1253,7 @@ class Post extends Model {
 			->andEditor()
 			->andReports();
 	}
-	
+
 	public function scopeWithEverythingAndReplies($query)
 	{
 		return $query->op()
@@ -1239,7 +1262,7 @@ class Post extends Model {
 				$query->withEverything();
 			}]);
 	}
-	
+
 	public function scopeWhereHasReports($query)
 	{
 		return $query->whereHas('reports', function($query)
@@ -1247,7 +1270,7 @@ class Post extends Model {
 				$query->whereOpen();
 			});
 	}
-	
+
 	public function scopeWhereHasReportsFor($query, PermissionUser $user)
 	{
 		return $query->whereHas('reports', function($query) use ($user)
@@ -1260,7 +1283,7 @@ class Post extends Model {
 				$query->whereResponsibleFor($user);
 			}]);
 	}
-	
+
 	/**
 	 * Logic for pulling posts for API updates.
 	 *
@@ -1291,8 +1314,8 @@ class Post extends Model {
 			// Order by board id in reverse order (so they appear in the thread right).
 			->orderBy('posts.board_id', 'asc');
 	}
-	
-	
+
+
 	/**
 	 * Fetches a URL for either this thread or an action.
 	 *
@@ -1302,7 +1325,7 @@ class Post extends Model {
 	public function url($action = null)
 	{
 		$url = "";
-		
+
 		if (is_null($action))
 		{
 			if ($this->reply_to_board_id)
@@ -1318,10 +1341,10 @@ class Post extends Model {
 		{
 			$url = "/{$this->board_uri}/post/{$this->board_id}/{$action}";
 		}
-		
+
 		return $url;
 	}
-	
+
 	/**
 	 * Fetches a URL for JSON requests that will update this thread or post.
 	 *
@@ -1331,7 +1354,7 @@ class Post extends Model {
 	public function urlJson($thread = true)
 	{
 		$url = "";
-		
+
 		if ($thread)
 		{
 			if ($this->reply_to_board_id)
@@ -1347,10 +1370,10 @@ class Post extends Model {
 		{
 			$url = "/{$this->board_uri}/post/{$this->board_id}.json";
 		}
-		
+
 		return $url;
 	}
-	
+
 	/**
 	 * Fetches a URL for this post, with the reply-to hash.
 	 *
@@ -1359,7 +1382,7 @@ class Post extends Model {
 	public function urlReply()
 	{
 		$url = "";
-		
+
 		if ($this->reply_to_board_id)
 		{
 			$url = "/{$this->board_uri}/thread/{$this->reply_to_board_id}#reply-{$this->board_id}";
@@ -1368,10 +1391,10 @@ class Post extends Model {
 		{
 			$url = "/{$this->board_uri}/thread/{$this->board_id}#reply-{$this->board_id}";
 		}
-		
+
 		return $url;
 	}
-	
+
 	/**
 	 * Sends a redirect to the post's page.
 	 *
@@ -1382,7 +1405,7 @@ class Post extends Model {
 	{
 		return redirect($this->url($action));
 	}
-	
+
 	/**
 	 * Pushes the post to the specified board, as a new thread or as a reply.
 	 * This autoatically handles concurrency issues. Creating a new reply without
@@ -1397,12 +1420,14 @@ class Post extends Model {
 	{
 		$this->board_uri      = $board->board_uri;
 		$this->author_ip      = inet_pton(Request::ip());
+		// Hash the salt because I honestly don't know if $this->save() is safe enough to parse unsanized information into.
+		$this->author_salt	  = hash(env('APP_HASH'), Cookie::get('author_salt'));
 		$this->author_country = $board->getConfig('postsAuthorCountry', false) ? new Geolocation() : null;
 		$this->reply_last     = $this->freshTimestamp();
 		$this->bumped_last    = $this->reply_last;
 		$this->setCreatedAt($this->reply_last);
 		$this->setUpdatedAt($this->reply_last);
-		
+
 		if (!is_null($thread) && !($thread instanceof Post))
 		{
 			$thread = $board->getLocalThread($thread);
@@ -1419,36 +1444,36 @@ class Post extends Model {
 			$secure_tripcode_requested = ($match[2] == '##');
 			// Convert password to tripcode, store tripcode hash in DB.
 			$this->insecure_tripcode = ContentFormatter::formatInsecureTripcode($match[3]);
-			
+
 		}
-		
+
 		// Store the post in the database.
 		DB::transaction(function() use ($board, $thread)
 		{
 			// The objective of this transaction is to prevent concurrency issues in the database
 			// on the unique joint index [`board_uri`,`board_id`] which is generated procedurally
 			// alongside the primary autoincrement column `post_id`.
-			
+
 			// First instruction is to add +1 to posts_total and set the last_post_at on the Board table.
 			DB::table('boards')
 				->where('board_uri', $this->board_uri)
 				->increment('posts_total');
-			
+
 			DB::table('boards')
 				->where('board_uri', $this->board_uri)
 				->update([
 					'last_post_at' => $this->created_at,
 				]);
-			
+
 			// Second, we record this value and lock the table.
 			$boards = DB::table('boards')
 				->where('board_uri', $this->board_uri)
 				->lockForUpdate()
 				->select('posts_total')
 				->get();
-			
+
 			$posts_total = $boards[0]->posts_total;
-			
+
 			// Optionally, the OP of this thread needs a +1 to reply count.
 			if ($thread instanceof Post)
 			{
@@ -1461,39 +1486,40 @@ class Post extends Model {
 					// makes it think the OP post has had its content edited.
 					$thread->updated_at  = $thread->updated_at;
 				}
-				
+
 				$thread->reply_last  = $this->created_at;
 				$thread->reply_count += 1;
 				$thread->save();
 			}
-			
+
 			// Optionally, we also expend the adventure.
 			$adventure = BoardAdventure::getAdventure($board);
-			
+
 			if ($adventure)
 			{
 				$this->adventure_id = $adventure->adventure_id;
 				$adventure->expended_at = $this->created_at;
 				$adventure->save();
 			}
-			
-			
+
+
 			// Finally, we set our board_id and save.
 			$this->board_id  = $posts_total;
+			//$this->author_salt =
 			$this->author_id = $this->makeAuthorId();
 			$this->save();
-			
+
 			// Queries and locks are handled automatically after this closure ends.
 		});
-		
+
 		// Process uploads.
 		$uploads = [];
-		
+
 		// Check file uploads.
 		if (is_array($files = Input::file('files')))
 		{
 			$uploads = array_filter($files);
-			
+
 			if (count($uploads) > 0)
 			{
 				foreach ($uploads as $uploadIndex => $upload)
@@ -1511,35 +1537,35 @@ class Post extends Model {
 			$hashes   = $files['hash'];
 			$names    = $files['name'];
 			$spoilers = isset($files['spoiler']) ? $files['spoiler'] : [];
-			
+
 			$storages = FileStorage::whereIn('hash', $hashes)->get();
-			
+
 			foreach ($hashes as $index => $hash)
 			{
 				if (!isset($uniques[$hash]))
 				{
 					$uniques[$hash] = true;
 					$storage = $storages->where('hash', $hash)->first();
-					
+
 					if ($storage && !$storage->banned)
 					{
 						$spoiler = isset($spoilers[$index]) ? $spoilers[$index] == 1 : false;
-						
+
 						$uploads[] = $storage->createAttachmentWithThis($this, $names[$index], $spoiler, false);
 					}
 				}
 			}
-			
+
 			$this->attachmentLinks()->saveMany($uploads);
 			FileStorage::whereIn('hash', $hashes)->increment('upload_count');
 		}
-		
-		
+
+
 		// Finally fire event on OP, if it exists.
 		if ($thread instanceof Post)
 		{
 			Event::fire(new ThreadNewReply($thread));
 		}
 	}
-	
+
 }

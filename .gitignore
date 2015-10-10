@@ -3,3 +3,9 @@
 /vendor
 .env
 composer.lock
+
+# Ignore my FTP config for auto-syncing of files to my development environment
+.ftpconfig
+
+# Don't accidentally upload composer.phar
+.composer.phar
